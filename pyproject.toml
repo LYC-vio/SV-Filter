@@ -10,10 +10,12 @@ dependencies = [
     "pandas>=3.0.0",
     "pysam>=0.23.3",
     "seaborn>=0.13.2",
+    "torch>=2.10.0",
 ]
 
 [dependency-groups]
 dev = [
+    "ipykernel>=7.2.0",
     "pre-commit>=4.5.1",
     "ruff>=0.15.0",
 ]
