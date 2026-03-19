@@ -88,7 +88,9 @@ class SVWindowDataset(Dataset[tuple[Tensor, Tensor]]):
 
         files = sorted(split_directory.glob("*.npy"))
         if not files:
-            raise ValueError(f"No .npy files found in split directory: {split_directory}")
+            raise ValueError(
+                f"No .npy files found in split directory: {split_directory}"
+            )
 
         missing_labels = [path.name for path in files if path.name not in labels]
         if missing_labels:
@@ -212,9 +214,7 @@ class MetricsAccumulator:
             elementwise_accuracy=safe_divide(
                 self.elementwise_correct, self.elementwise_total
             ),
-            exact_match_accuracy=safe_divide(
-                self.exact_match_count, self.sample_count
-            ),
+            exact_match_accuracy=safe_divide(self.exact_match_count, self.sample_count),
             any_sv_precision=any_sv_precision,
             any_sv_recall=any_sv_recall,
             any_sv_f1=any_sv_f1,
@@ -361,11 +361,19 @@ def parse_args() -> argparse.Namespace:
         required=True,
         help="Directory for checkpoints and metrics.",
     )
-    parser.add_argument("--epochs", type=int, default=20, help="Number of training epochs.")
+    parser.add_argument(
+        "--epochs", type=int, default=20, help="Number of training epochs."
+    )
     parser.add_argument("--batch-size", type=int, default=32, help="Batch size.")
-    parser.add_argument("--learning-rate", type=float, default=1e-4, help="Adam learning rate.")
-    parser.add_argument("--weight-decay", type=float, default=0.0, help="Adam weight decay.")
-    parser.add_argument("--num-workers", type=int, default=0, help="DataLoader worker processes.")
+    parser.add_argument(
+        "--learning-rate", type=float, default=1e-4, help="Adam learning rate."
+    )
+    parser.add_argument(
+        "--weight-decay", type=float, default=0.0, help="Adam weight decay."
+    )
+    parser.add_argument(
+        "--num-workers", type=int, default=0, help="DataLoader worker processes."
+    )
     parser.add_argument("--seed", type=int, default=42, help="Random seed.")
     parser.add_argument(
         "--device",

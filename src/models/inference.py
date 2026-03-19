@@ -26,7 +26,9 @@ class SVInferenceDataset(Dataset[tuple[Tensor, str]]):
 
         self.samples = sorted(split_directory.glob("*.npy"))
         if not self.samples:
-            raise ValueError(f"No .npy files found in split directory: {split_directory}")
+            raise ValueError(
+                f"No .npy files found in split directory: {split_directory}"
+            )
 
         for sample_path in self.samples:
             array = np.load(sample_path, mmap_mode="r")
@@ -130,10 +132,14 @@ def run_inference(
 
     with torch.no_grad():
         for features, batch_file_names in dataloader:
-            features = features.to(device=device, dtype=torch.float32, non_blocking=True)
+            features = features.to(
+                device=device, dtype=torch.float32, non_blocking=True
+            )
             logits = model(features)
             probabilities = torch.sigmoid(logits).cpu()
-            binary_outputs = (probabilities >= prediction_threshold).to(dtype=torch.int64)
+            binary_outputs = (probabilities >= prediction_threshold).to(
+                dtype=torch.int64
+            )
 
             file_names.extend(batch_file_names)
             probability_predictions.extend(probabilities)
@@ -168,7 +174,9 @@ def parse_args() -> argparse.Namespace:
         required=True,
         help="Path to the output TSV file.",
     )
-    parser.add_argument("--batch-size", type=int, default=64, help="Inference batch size.")
+    parser.add_argument(
+        "--batch-size", type=int, default=64, help="Inference batch size."
+    )
     parser.add_argument(
         "--num-workers",
         type=int,

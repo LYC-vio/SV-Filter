@@ -240,7 +240,9 @@ class SVHunterModel(nn.Module):
             )
 
         batch_size = x.shape[0]
-        x = x.view(batch_size, self.num_subwindows, self.subwindow_size, self.num_features)
+        x = x.view(
+            batch_size, self.num_subwindows, self.subwindow_size, self.num_features
+        )
         x = x.unsqueeze(2).reshape(
             batch_size * self.num_subwindows, 1, self.subwindow_size, self.num_features
         )
