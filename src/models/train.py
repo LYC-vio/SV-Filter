@@ -100,7 +100,12 @@ def load_labels(labels_file_path: Path) -> dict[str, Tensor]:
 
 
 class SVWindowDataset(Dataset[tuple[Tensor, Tensor]]):
-    def __init__(self, split_directory: Path, labels: dict[str, Tensor]) -> None:
+    def __init__(
+        self,
+        split_directory: Path,
+        labels: dict[str, Tensor],
+        max_samples: int | None = None,
+    ) -> None:
         if not split_directory.exists():
             raise FileNotFoundError(f"Split directory not found: {split_directory}")
         if not split_directory.is_dir():
@@ -111,6 +116,10 @@ class SVWindowDataset(Dataset[tuple[Tensor, Tensor]]):
             raise ValueError(
                 f"No .npy files found in split directory: {split_directory}"
             )
+        if max_samples is not None:
+            if max_samples <= 0:
+                raise ValueError("--max_samples must be a positive integer")
+            files = files[:max_samples]
 
         missing_labels = [path.name for path in files if path.name not in labels]
         if missing_labels:
@@ -246,12 +255,17 @@ def create_dataloader(
     batch_size: int,
     shuffle: bool,
     num_workers: int,
+    max_samples: int | None = None,
 ) -> DataLoader[tuple[Tensor, Tensor]]:
     resolved_labels_file_path = resolve_labels_file_path(
         split_directory=split_directory,
     )
     labels = load_labels(resolved_labels_file_path)
-    dataset = SVWindowDataset(split_directory=split_directory, labels=labels)
+    dataset = SVWindowDataset(
+        split_directory=split_directory,
+        labels=labels,
+        max_samples=max_samples,
+    )
     return DataLoader(
         dataset,
         batch_size=batch_size,
@@ -364,6 +378,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--learning_rate", type=float, default=1e-4, help="Adam learning rate.")
     parser.add_argument("--weight_decay", type=float, default=0.0, help="Adam weight decay.")
     parser.add_argument("--num_workers", type=int, default=0, help="DataLoader worker processes.")
+    parser.add_argument("--max_samples", type=int, default=None, help="Optional cap on the number of samples loaded from each split for development and testing.")
     parser.add_argument("--seed", type=int, default=42, help="Random seed.")
     parser.add_argument("--device", type=str, default=get_default_device_name(), help="Training device, for example cpu, mps, or cuda.")
     parser.add_argument("--wandb_mode", type=str, choices=("online", "offline", "disabled"), default="online", help="Weights & Biases logging mode.")
@@ -385,18 +400,21 @@ def train(arguments: argparse.Namespace) -> dict[str, Any]:
             batch_size=arguments.batch_size,
             shuffle=True,
             num_workers=arguments.num_workers,
+            max_samples=arguments.max_samples,
         )
         validation_loader = create_dataloader(
             split_directory=arguments.validation_directory,
             batch_size=arguments.batch_size,
             shuffle=False,
             num_workers=arguments.num_workers,
+            max_samples=arguments.max_samples,
         )
         test_loader = create_dataloader(
             split_directory=arguments.test_directory,
             batch_size=arguments.batch_size,
             shuffle=False,
             num_workers=arguments.num_workers,
+            max_samples=arguments.max_samples,
         )
 
         device = torch.device(arguments.device)
