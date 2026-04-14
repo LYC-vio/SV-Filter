@@ -127,13 +127,13 @@ class SVHunterModel(nn.Module):
         num_features: int = 9,
         subwindow_size: int = 200,
         num_subwindows: int = 10,
-        embedding_dimension: int = 100,
+        embedding_dimension: int = 128,
         num_heads: int = 4,
         key_dimension: int = 32,
-        num_transformer_blocks: int = 3,
-        multilayer_perceptron_hidden_dimension: int = 128,
-        attention_dropout: float = 0.3,
-        head_dropout: float = 0.4,
+        num_transformer_blocks: int = 4,
+        multilayer_perceptron_hidden_dimension: int = 384,
+        attention_dropout: float = 0.1,
+        head_dropout: float = 0.2,
     ) -> None:
         super().__init__()
         if input_length != subwindow_size * num_subwindows:
@@ -143,7 +143,10 @@ class SVHunterModel(nn.Module):
         self.num_features = num_features
         self.subwindow_size = subwindow_size
         self.num_subwindows = num_subwindows
-        self.encoder = SVHunterSubwindowEncoder(num_features=num_features)
+        self.input_norm = nn.LayerNorm(num_features)
+        self.input_pos_embedding = nn.Parameter(torch.zeros(1, input_length, 1))
+        nn.init.normal_(self.input_pos_embedding, std=0.02)
+        self.encoder = SVHunterSubwindowEncoder(num_features=num_features + 1)
         self.patch_projection = nn.Linear(
             self.encoder.output_dimension, embedding_dimension
         )
@@ -187,11 +190,16 @@ class SVHunterModel(nn.Module):
             )
 
         batch_size = x.shape[0]
+        x = self.input_norm(x)
+        x = torch.cat([x, self.input_pos_embedding.expand(batch_size, -1, -1)], dim=-1)
         x = x.view(
-            batch_size, self.num_subwindows, self.subwindow_size, self.num_features
+            batch_size, self.num_subwindows, self.subwindow_size, self.num_features + 1
         )
         x = x.unsqueeze(2).reshape(
-            batch_size * self.num_subwindows, 1, self.subwindow_size, self.num_features
+            batch_size * self.num_subwindows,
+            1,
+            self.subwindow_size,
+            self.num_features + 1,
         )
         x = self.encoder(x)
         x = x.view(batch_size, self.num_subwindows, self.encoder.output_dimension)

@@ -11,7 +11,8 @@ import numpy as np
 import torch
 import wandb
 from torch import Tensor, nn
-from torch.optim import Adam
+from torch.optim import AdamW
+from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.data import DataLoader, Dataset
 
 try:
@@ -294,7 +295,7 @@ def run_epoch(
     dataloader: DataLoader[tuple[Tensor, Tensor]],
     criterion: nn.Module,
     device: torch.device,
-    optimizer: Adam | None = None,
+    optimizer: AdamW | None = None,
 ) -> EpochMetrics:
     training = optimizer is not None
     model.train(training)
@@ -321,7 +322,7 @@ def run_epoch(
 def save_checkpoint(
     path: Path,
     model: nn.Module,
-    optimizer: Adam,
+    optimizer: AdamW,
     epoch: int,
     metrics: EpochMetrics,
     args: argparse.Namespace,
@@ -374,9 +375,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--test_directory", dest="test_directory", type=Path, required=True, help="Directory of test .npy files.")
     parser.add_argument("--output_directory", dest="output_directory", type=Path, required=True, help="Directory for checkpoints and metrics.")
     parser.add_argument("--epochs", type=int, default=20, help="Number of training epochs.")
-    parser.add_argument("--batch_size", type=int, default=32, help="Batch size.")
-    parser.add_argument("--learning_rate", type=float, default=1e-4, help="Adam learning rate.")
-    parser.add_argument("--weight_decay", type=float, default=0.0, help="Adam weight decay.")
+    parser.add_argument("--batch_size", type=int, default=64, help="Batch size.")
+    parser.add_argument("--learning_rate", type=float, default=2e-4, help="AdamW learning rate.")
+    parser.add_argument("--weight_decay", type=float, default=1e-3, help="AdamW weight decay.")
     parser.add_argument("--num_workers", type=int, default=0, help="DataLoader worker processes.")
     parser.add_argument("--max_samples", type=int, default=None, help="Optional cap on the number of samples loaded from each split for development and testing.")
     parser.add_argument("--seed", type=int, default=42, help="Random seed.")
@@ -420,11 +421,12 @@ def train(arguments: argparse.Namespace) -> dict[str, Any]:
         device = torch.device(arguments.device)
         model = SVHunterModel().to(device)
         criterion = nn.BCEWithLogitsLoss()
-        optimizer = Adam(
+        optimizer = AdamW(
             model.parameters(),
             lr=arguments.learning_rate,
             weight_decay=arguments.weight_decay,
         )
+        scheduler = CosineAnnealingLR(optimizer, T_max=arguments.epochs, eta_min=1e-6)
 
         best_validation_f1 = float("-inf")
         history: list[dict[str, Any]] = []
@@ -444,6 +446,8 @@ def train(arguments: argparse.Namespace) -> dict[str, Any]:
                 device=device,
                 optimizer=None,
             )
+
+            scheduler.step()
 
             epoch_record = {
                 "epoch": epoch,
