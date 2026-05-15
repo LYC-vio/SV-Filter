@@ -16,7 +16,8 @@ import csv
 import itertools
 import math
 import os
-from dataclasses import dataclass, field
+from concurrent.futures import ProcessPoolExecutor
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
@@ -26,15 +27,14 @@ import pysam
 
 DNA_ALPHABET = "ACGT"
 REVCOMP_TABLE = str.maketrans("ACGTacgt", "TGCAtgca")
+ReadContigKey = Tuple[str, str]
 
 
 @dataclass
 class ReadContigEvidence:
-    """Aggregated evidence for one read aligned to one contig."""
+    """Scoring evidence for one read aligned to one contig."""
 
-    read_name: str
     contig: str
-    records: List[pysam.AlignedSegment] = field(default_factory=list)
     query_start: Optional[int] = None
     query_end: Optional[int] = None
     max_mapq: int = -1
@@ -43,9 +43,8 @@ class ReadContigEvidence:
     kmer_vector: Optional[np.ndarray] = None
 
     def add_record(self, record: pysam.AlignedSegment, query_span: Tuple[int, int]) -> None:
-        """Add one alignment record to this read-contig evidence object."""
+        """Add alignment-derived metadata to this evidence object."""
 
-        self.records.append(record)
         start, end = query_span
         self.query_start = start if self.query_start is None else min(self.query_start, start)
         self.query_end = end if self.query_end is None else max(self.query_end, end)
@@ -173,14 +172,6 @@ def cosine_distance(vector1: np.ndarray, vector2: np.ndarray) -> float:
     return 1.0 - similarity
 
 
-def read_sequence_priority(record: pysam.AlignedSegment) -> Tuple[int, int, int]:
-    """Rank records for recovering a representative full read sequence."""
-
-    sequence = record.query_sequence
-    sequence_length = len(sequence) if sequence else 0
-    return (sequence_length, record.mapping_quality, -int(record.is_reverse))
-
-
 def collect_read_sequences(bam_path: str) -> Dict[str, str]:
     """
     Collect one primary-alignment SEQ-field sequence for each read in the BAM.
@@ -194,7 +185,6 @@ def collect_read_sequences(bam_path: str) -> Dict[str, str]:
     """
 
     read_sequences: Dict[str, str] = {}
-    read_priorities: Dict[str, Tuple[int, int, int]] = {}
 
     with pysam.AlignmentFile(bam_path, "rb") as bam:
         for record in bam.fetch(until_eof=True):
@@ -203,11 +193,10 @@ def collect_read_sequences(bam_path: str) -> Dict[str, str]:
             sequence = record.query_sequence
             if not sequence:
                 continue
+            if record.query_name in read_sequences:
+                continue
 
-            priority = read_sequence_priority(record)
-            if priority > read_priorities.get(record.query_name, (-1, -1, -1)):
-                read_sequences[record.query_name] = sequence.upper()
-                read_priorities[record.query_name] = priority
+            read_sequences[record.query_name] = sequence.upper()
 
     return read_sequences
 
@@ -252,11 +241,16 @@ def collect_read_evidence(
     read_sequences: Dict[str, str],
     kmer_index: Dict[str, int],
     k: int,
-) -> Tuple[Dict[str, Dict[str, ReadContigEvidence]], pysam.AlignmentHeader]:
+) -> Tuple[
+    Dict[str, Dict[str, ReadContigEvidence]],
+    Dict[ReadContigKey, List[pysam.AlignedSegment]],
+    pysam.AlignmentHeader,
+]:
     """Collect per-read, per-contig alignment evidence from the BAM."""
 
     fasta_contig_set = set(fasta_contigs)
     read_evidence: Dict[str, Dict[str, ReadContigEvidence]] = {}
+    records_by_read_contig: Dict[ReadContigKey, List[pysam.AlignedSegment]] = {}
     missing_primary_sequence_records = 0
 
     with pysam.AlignmentFile(bam_path, "rb") as bam:
@@ -292,9 +286,13 @@ def collect_read_evidence(
             per_read = read_evidence.setdefault(record.query_name, {})
             evidence = per_read.setdefault(
                 record.reference_name,
-                ReadContigEvidence(record.query_name, record.reference_name),
+                ReadContigEvidence(record.reference_name),
             )
             evidence.add_record(record, query_span)
+            records_by_read_contig.setdefault(
+                (record.query_name, record.reference_name),
+                [],
+            ).append(record)
 
     if missing_primary_sequence_records:
         print(
@@ -303,11 +301,11 @@ def collect_read_evidence(
             "did not have a primary-alignment sequence in this BAM."
         )
 
-    for per_read in read_evidence.values():
+    for read_name, per_read in read_evidence.items():
         for evidence in per_read.values():
-            evidence.finalize(read_sequences.get(evidence.read_name), kmer_index, k)
+            evidence.finalize(read_sequences.get(read_name), kmer_index, k)
 
-    return read_evidence, header
+    return read_evidence, records_by_read_contig, header
 
 
 def evidence_sort_key(evidence: ReadContigEvidence) -> Tuple[int, int, int, str]:
@@ -375,17 +373,52 @@ def score_all_pairs(
     contigs: Sequence[str],
     contig_vectors: Dict[str, np.ndarray],
     read_evidence: Dict[str, Dict[str, ReadContigEvidence]],
+    threads: int = 1,
 ) -> List[PairScore]:
     """Score every unordered contig pair, including self-pairs."""
 
-    scores = []
-    for contig1, contig2 in itertools.combinations_with_replacement(contigs, 2):
-        score = score_pair(contig1, contig2, contig_vectors, read_evidence)
-        if math.isnan(score.cosine_distance):
-            continue
-        scores.append(score)
+    pairs = list(itertools.combinations_with_replacement(contigs, 2))
+    if threads == 1:
+        scores = [
+            score_pair(contig1, contig2, contig_vectors, read_evidence)
+            for contig1, contig2 in pairs
+        ]
+    else:
+        chunksize = max(1, len(pairs) // (threads * 4))
+        with ProcessPoolExecutor(
+            max_workers=threads,
+            initializer=init_score_worker,
+            initargs=(contig_vectors, read_evidence),
+        ) as executor:
+            scores = list(executor.map(score_pair_worker, pairs, chunksize=chunksize))
 
+    scores = [score for score in scores if not math.isnan(score.cosine_distance)]
     return sorted(scores, key=lambda s: (s.cosine_distance, -s.reads_used, s.contig1, s.contig2))
+
+
+_WORKER_CONTIG_VECTORS: Optional[Dict[str, np.ndarray]] = None
+_WORKER_READ_EVIDENCE: Optional[Dict[str, Dict[str, ReadContigEvidence]]] = None
+
+
+def init_score_worker(
+    contig_vectors: Dict[str, np.ndarray],
+    read_evidence: Dict[str, Dict[str, ReadContigEvidence]],
+) -> None:
+    """Initialize multiprocessing workers with read-only scoring data."""
+
+    global _WORKER_CONTIG_VECTORS, _WORKER_READ_EVIDENCE
+    _WORKER_CONTIG_VECTORS = contig_vectors
+    _WORKER_READ_EVIDENCE = read_evidence
+
+
+def score_pair_worker(pair: Tuple[str, str]) -> PairScore:
+    """Score one contig pair inside a multiprocessing worker."""
+
+    if _WORKER_CONTIG_VECTORS is None or _WORKER_READ_EVIDENCE is None:
+        raise RuntimeError("Score worker was not initialized")
+
+    contig1, contig2 = pair
+    return score_pair(contig1, contig2, _WORKER_CONTIG_VECTORS, _WORKER_READ_EVIDENCE)
 
 
 def cluster_name_from_fasta(fasta_path: str) -> str:
@@ -423,6 +456,7 @@ def write_pair_bams(
     out_dir: str,
     header: pysam.AlignmentHeader,
     read_evidence: Dict[str, Dict[str, ReadContigEvidence]],
+    records_by_read_contig: Dict[ReadContigKey, List[pysam.AlignedSegment]],
     sort_index: bool,
 ) -> List[str]:
     """Write retained alignments for one ranked pair to per-contig BAM files."""
@@ -447,13 +481,13 @@ def write_pair_bams(
         for contig, temp_path in temp_paths.items()
     }
     try:
-        for per_read in read_evidence.values():
+        for read_name, per_read in read_evidence.items():
             evidence = choose_evidence_for_pair(per_read, score.contig1, score.contig2)
             if evidence is None:
                 continue
             if evidence.contig not in writers:
                 continue
-            for record in evidence.records:
+            for record in records_by_read_contig.get((read_name, evidence.contig), []):
                 writers[evidence.contig].write(record)
     finally:
         for writer in writers.values():
@@ -512,13 +546,10 @@ def write_summary_tsv(
 def run(args: argparse.Namespace) -> None:
     """Execute the contig-pair k-mer filtering workflow."""
 
-    if pysam is None:
-        raise SystemExit(
-            "ERROR: pysam is required to read and write BAM files. "
-            "Install pysam in the environment used to run this script."
-        )
     if args.top_n <= 0:
         raise ValueError("--top-n must be a positive integer")
+    if args.threads <= 0:
+        raise ValueError("--threads must be a positive integer")
 
     os.makedirs(args.out_dir, exist_ok=True)
 
@@ -532,7 +563,7 @@ def run(args: argparse.Namespace) -> None:
     }
 
     read_sequences = collect_read_sequences(args.bam)
-    read_evidence, header = collect_read_evidence(
+    read_evidence, records_by_read_contig, header = collect_read_evidence(
         args.bam,
         contigs,
         read_sequences,
@@ -541,7 +572,7 @@ def run(args: argparse.Namespace) -> None:
     )
 
     expected_pairs = len(contigs) * (len(contigs) + 1) // 2
-    scores = score_all_pairs(contigs, contig_vectors, read_evidence)
+    scores = score_all_pairs(contigs, contig_vectors, read_evidence, args.threads)
     top_scores = scores[: args.top_n]
 
     ranked_scores: List[PairScore] = []
@@ -553,6 +584,7 @@ def run(args: argparse.Namespace) -> None:
             args.out_dir,
             header,
             read_evidence,
+            records_by_read_contig,
             sort_index=not args.no_sort_index,
         )
         ranked_scores.append(
@@ -579,6 +611,7 @@ def run(args: argparse.Namespace) -> None:
     print(f"Loaded {len(contigs)} contigs from FASTA")
     print(f"Recovered full read sequences for {len(read_sequences)} reads")
     print(f"Expected pairs: {expected_pairs}; scored pairs with usable k-mers: {len(scores)}")
+    print(f"Scoring threads: {args.threads}")
     print(f"Wrote top {len(ranked_scores)} ranked pair directories to {cluster_dir}")
     print(f"Wrote summary TSV: {summary_path}")
 
@@ -597,6 +630,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--out-dir", required=True, help="Output directory")
     parser.add_argument("--k", type=int, default=4, help="k-mer size (default: 4)")
     parser.add_argument("--top-n", type=int, default=10, help="Number of top pairs to write (default: 10)")
+    parser.add_argument("--threads", type=int, default=1, help="Number of worker processes for pair scoring")
     parser.add_argument(
         "--no-sort-index",
         action="store_true",

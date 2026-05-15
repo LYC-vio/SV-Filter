@@ -6,7 +6,6 @@
 # This is originally the flank_SV.py
 #
 # changes:
-# - Removed unused commented-out legacy code blocks from v2.
 # - Split FASTA header construction and haplotype sequence construction into
 #   helper methods.
 # - FASTA filenames record the shared cluster location as chrom_start-end.fasta.
@@ -14,6 +13,8 @@
 #   SVs=id1;id2|GT=gt1:gt2|hapSV=sv_id:start-end;sv_id:start-end.
 #   hapSV coordinates are 0-based, half-open positions on the constructed
 #   sequence; all-reference haplotypes use hapSV=NA.
+
+# TODO: add methods to handle sequence collisions (different SV genotypes, but representing/generating the same sequence)
 
 import itertools
 import os
