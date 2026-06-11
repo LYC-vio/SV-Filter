@@ -23,8 +23,11 @@ def extract_sv_regions(vcf_path):
     vcf = pysam.VariantFile(vcf_path)
     for record in vcf.fetch():
         chrom = record.chrom
-        start = record.pos
-        end = record.stop if record.stop else record.pos + 1
+        # record.pos is 1-based, but we want 0-based coordinates for consistency with BAM and other tools
+        # record.start: The record start position on chrom/contig (0-based inclusive).
+        # record.stop: The record stop position on chrom/contig (0-based exclusive).
+        start = record.start
+        end = record.stop if record.stop else record.start + 1
         sv_regions[chrom].append((start, end))
 
     for chrom in sv_regions.keys():
@@ -59,7 +62,7 @@ def cluster_svs(sv_regions, chrome_lens, distance_threshold=1999):
     return clustered_regions
 
 
-def sample_non_sv_windows(clustered_sv_regions, chrome_lens, window_size=2000, sample_per_chrom=1000):
+def sample_non_sv_windows(clustered_sv_regions, chrome_lens, window_size=2000, sample_per_chrom=500):
     non_sv_windows = defaultdict(list)
 
     # for chrom, chrom_len in chrome_lens.items():
@@ -215,6 +218,9 @@ def generate_labeled_windows(chrom, target_region, bam_file, output_dir, width=2
         output_path = f"{output_dir}/{chrom}_{win_start}_{win_end}.npy"
 
         encoded_window = encode_region(bam, chrom, win_start, win_end)
+
+        if non_sv and not np.any(encoded_window[:, 8]): # if no reads aligned in this non SV window, skip it to save space and avoid training on empty data
+            continue
 
         np.save(output_path, encoded_window)
 
