@@ -10,9 +10,10 @@
 #   helper methods.
 # - FASTA filenames record the shared cluster location as chrom_start-end.fasta.
 # - FASTA headers use pipe-delimited fields for haplotype-specific information:
-#   SVs=id1;id2|GT=gt1:gt2|hapSV=sv_id:start-end;sv_id:start-end.
-#   hapSV coordinates are 0-based, half-open positions on the constructed
-#   sequence; all-reference haplotypes use hapSV=NA.
+#   SVs=sv_id:start-end;...|GT=gt1:gt2.
+#   Coordinates are 0-based, half-open positions on the constructed sequence.
+#   Active SVs use their full allele interval; inactive SVs use a one-base
+#   anchor at their projected reference location.
 
 # TODO: add methods to handle sequence collisions (different SV genotypes, but representing/generating the same sequence)
 
@@ -33,13 +34,13 @@ class SVCluster:
         self.chrom = sv["chrom"]
         self.ids = [sv["id"]]
         self.bps = [(sv["start"], sv["end"])]
-        self.seqs = [sv["seqs"]]
+        self.alleles = [sv["alleles"]]
         self.gts = [["0" if i == "." else i for i in sv["gt"]]]
 
     def add_sv(self, sv):
         self.ids.append(sv["id"])
         self.bps.append((sv["start"], sv["end"]))
-        self.seqs.append(sv["seqs"])
+        self.alleles.append(sv["alleles"])
         self.gts.append(["0" if i == "." else i for i in sv["gt"]])
 
     def find_overlaps(self, hap_gts):
@@ -76,37 +77,57 @@ class SVCluster:
         return cluster_start, min(cluster_end, chrom_len)
 
     def make_header(self, hap_gt, sv_intervals):
-        sv_ids = ";".join(self.ids)
+        sv_names = ";".join(
+            f"{self.ids[sv_index]}:{seq_start}-{seq_end}"
+            for sv_index, seq_start, seq_end in sv_intervals
+        )
         gt_name = ":".join(str(gt) for gt in hap_gt)
-        if sv_intervals:
-            interval_name = ";".join(
-                f"{self.ids[sv_index]}:{seq_start}-{seq_end}"
-                for sv_index, seq_start, seq_end in sv_intervals
-            )
-        else:
-            interval_name = "NA"
+        return f">SVs={sv_names}|GT={gt_name}\n"
 
-        return f">SVs={sv_ids}|GT={gt_name}|hapSV={interval_name}\n"
+    @staticmethod
+    def project_ref_boundary(ref_pos, active_mappings, cluster_start, boundary):
+        shift = 0
+        for ref_start, ref_end, hap_start, hap_end in active_mappings:
+            if ref_pos < ref_start:
+                break
+            if ref_pos == ref_start:
+                return hap_start
+            if ref_pos < ref_end:
+                return hap_start if boundary == "start" else hap_end
+            if ref_pos == ref_end:
+                return hap_end
+            shift += (hap_end - hap_start) - (ref_end - ref_start)
+
+        return ref_pos - cluster_start + shift
+
+    @staticmethod
+    def one_base_anchor(position, sequence_length):
+        anchor_start = min(max(position, 0), sequence_length - 1)
+        return anchor_start, anchor_start + 1
 
     def build_haplotype_sequence(self, cluster_start, cluster_end, hap_gt):
         hap_bps = [self.bps[i] for i in range(len(hap_gt)) if hap_gt[i] != 0]
-        hap_seqs = [self.seqs[i][hap_gt[i]] for i in range(len(hap_gt)) if hap_gt[i] != 0]
+        hap_seqs = [self.alleles[i][hap_gt[i]] for i in range(len(hap_gt)) if hap_gt[i] != 0]
         hap_indexes = [i for i in range(len(hap_gt)) if hap_gt[i] != 0]
 
         if len(hap_bps) == 0:
             seq = get_ref(SVCluster.ref, SVCluster.fai_dict, self.chrom, cluster_start, cluster_end)
-            return seq, []
+            sv_intervals = []
+            for sv_index, (start, _) in enumerate(self.bps):
+                seq_start, seq_end = self.one_base_anchor(start - cluster_start, len(seq))
+                sv_intervals.append((sv_index, seq_start, seq_end))
+            return seq, sv_intervals
 
         prefix = get_ref(SVCluster.ref, SVCluster.fai_dict, self.chrom, cluster_start, hap_bps[0][0])
         parts = [prefix]
-        sv_intervals = []
+        active_mappings = []
         current_pos = len(prefix)
 
         for i, (sv_index, hap_bp, hap_seq) in enumerate(zip(hap_indexes, hap_bps, hap_seqs)):
             seq_start = current_pos
             parts.append(hap_seq)
             current_pos += len(hap_seq)
-            sv_intervals.append((sv_index, seq_start, current_pos))
+            active_mappings.append((hap_bp[0], hap_bp[1], seq_start, current_pos))
 
             if i < len(hap_bps) - 1:
                 connect = get_ref(
@@ -121,7 +142,21 @@ class SVCluster:
 
         suffix = get_ref(SVCluster.ref, SVCluster.fai_dict, self.chrom, hap_bps[-1][1], cluster_end)
         parts.append(suffix)
-        return "".join(parts), sv_intervals
+        seq = "".join(parts)
+        active_intervals = {
+            sv_index: (hap_start, hap_end)
+            for sv_index, (_, _, hap_start, hap_end) in zip(hap_indexes, active_mappings)
+        }
+        sv_intervals = []
+        for sv_index, (start, _) in enumerate(self.bps):
+            if sv_index in active_intervals:
+                seq_start, seq_end = active_intervals[sv_index]
+            else:
+                projected_start = self.project_ref_boundary(start, active_mappings, cluster_start, "start")
+                seq_start, seq_end = self.one_base_anchor(projected_start, len(seq))
+            sv_intervals.append((sv_index, seq_start, seq_end))
+
+        return seq, sv_intervals
 
     def write(self, out_dir, flank):
         cluster_start, cluster_end = self.cluster_bounds(flank)

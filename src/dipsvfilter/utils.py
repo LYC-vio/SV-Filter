@@ -1,3 +1,4 @@
+from operator import gt
 import os
 import gzip
 
@@ -44,6 +45,19 @@ def get_ref(ref, fai_dict, chrom, start, end=None):
     return seq
 
 
+def open_variant_file(vcf, mode="r", header=None):
+    if header is None:
+        return pysam.VariantFile(vcf, mode)
+    return pysam.VariantFile(vcf, mode, header=header)
+
+
+def open_text_auto(path, mode="rt"):
+    if str(path).endswith(".gz"):
+        return gzip.open(path, mode)
+    return open(path, mode)
+
+
+# For now we assume the input VCF is biallelic and with sequences in the ALT field.
 def infer_sv_type(ref, alts, info):
     sv_type = info.get("SVTYPE")
     if sv_type:
@@ -65,36 +79,16 @@ def infer_sv_type(ref, alts, info):
 
     return None
 
-
-def open_variant_file(vcf, mode="r", header=None):
-    if header is None:
-        return pysam.VariantFile(vcf, mode)
-    return pysam.VariantFile(vcf, mode, header=header)
-
-
-def open_text_auto(path, mode="rt"):
-    if str(path).endswith(".gz"):
-        return gzip.open(path, mode)
-    return open(path, mode)
-
-
 def format_gt(sample_data):
-    gt = sample_data.get("GT")
-    if gt is None:
-        return None
-
-    alleles = ["." if allele is None else str(allele) for allele in gt]
-    if len(alleles) <= 1:
-        return alleles
-
+    gt = sample_data.get("GT", (".", "."))
+    alleles = [str(allele) if allele is not None else "." for allele in gt]
     separator = "|" if sample_data.phased else "/"
     formatted_gt = []
-    for index, allele in enumerate(alleles):
-        if index > 0:
+    for i, allele in enumerate(alleles):
+        if i > 0:
             formatted_gt.append(separator)
         formatted_gt.append(allele)
     return formatted_gt
-
 
 def parse_pysam_vcf_record(vcf_record):
     alts = list(vcf_record.alts or [])
@@ -105,24 +99,19 @@ def parse_pysam_vcf_record(vcf_record):
         gt = format_gt(vcf_record.samples[samples[0]])
 
     return {
-        "pysam_record": vcf_record,
+        # "pysam_record": vcf_record,
         "chrom": vcf_record.chrom,
-        "pos": vcf_record.pos,
         "id": vcf_record.id or ".",
         "ref": vcf_record.ref,
-        "alt": ",".join(alts),
-        "alts": alts,
-        "qual": vcf_record.qual,
-        "filter": list(vcf_record.filter.keys()),
-        "info": info,
+        "alts": list(vcf_record.alts or []),
+        # "filter": list(vcf_record.filter.keys()),
+        # "info": info,
         "sv_type": infer_sv_type(vcf_record.ref, alts, info),
-        "start": vcf_record.pos - 1,
-        "end": vcf_record.pos - 1 + len(vcf_record.ref),
-        "seqs": [vcf_record.ref] + alts,
-        "samples": samples,
+        "start": vcf_record.start,
+        "end": vcf_record.start + len(vcf_record.ref),
+        "alleles": vcf_record.alleles,
+        # "samples": samples,
         "gt": gt,
-        "is_header": False,
-        "is_malformed": False,
     }
 
 
