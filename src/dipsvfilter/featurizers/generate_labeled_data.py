@@ -7,6 +7,7 @@ from encode_read_alignment import encode_region
 from multiprocessing.pool import Pool
 import os
 import tqdm
+from utils import SimpleVCFParser
 
 pysam.set_verbosity(0) # temporary fix t supress pysam bai older than bam warnings
 
@@ -20,22 +21,19 @@ def get_chrome_len(fai_path):
 
 def extract_sv_regions(vcf_path):
     sv_regions = defaultdict(list)
-    vcf = pysam.VariantFile(vcf_path)
-    for record in vcf.fetch():
-        chrom = record.chrom
-        # record.pos is 1-based, but we want 0-based coordinates for consistency with BAM and other tools
-        # record.start: The record start position on chrom/contig (0-based inclusive).
-        # record.stop: The record stop position on chrom/contig (0-based exclusive).
-        start = record.start
-        end = record.stop if record.stop else record.start + 1
-        sv_regions[chrom].append((start, end))
+    for record in SimpleVCFParser(vcf_path):
+        chrom = record["chrom"]
+        start = record["start"]
+        end = record["end"]
+        sv_type = record["sv_type"]
+        sv_regions[chrom].append((start, end, sv_type))
 
     for chrom in sv_regions.keys():
         sv_regions[chrom] = sorted(sv_regions[chrom], key=lambda x: (x[0], x[1]))
 
     return sv_regions
 
-def cluster_svs(sv_regions, chrome_lens, distance_threshold=1999):
+def cluster_svs(sv_regions, chrome_lens, distance_threshold=2000):
     clustered_regions = defaultdict(list)
 
     for chrom, regions in sv_regions.items():
@@ -44,25 +42,26 @@ def cluster_svs(sv_regions, chrome_lens, distance_threshold=1999):
 
         chrom_len = chrome_lens[chrom]
 
-        current_start, current_end = regions[0]
+        current_start, current_end = regions[0][:2]
         svs_in_cluster = [regions[0]]
 
 
-        for start, end in regions[1:]:
-            if start - current_end <= distance_threshold:
+        for sv in regions[1:]:
+            start, end = sv[:2]
+            if start - current_end < distance_threshold:
                 current_end = max(current_end, end)
-                svs_in_cluster.append((start, end))
+                svs_in_cluster.append(sv)
             else:
                 clustered_regions[chrom].append([(max(0, current_start-distance_threshold), min(current_end+distance_threshold, chrom_len)), svs_in_cluster])
                 current_start, current_end = start, end
-                svs_in_cluster = [(start, end)]
+                svs_in_cluster = [sv]
 
         clustered_regions[chrom].append([(max(0, current_start-distance_threshold), min(current_end+distance_threshold, chrom_len)), svs_in_cluster])
 
     return clustered_regions
 
 
-def sample_non_sv_windows(clustered_sv_regions, chrome_lens, window_size=2000, sample_per_chrom=500):
+def sample_non_sv_windows(clustered_sv_regions, chrome_lens, window_size=2000, sample_per_chrom=50):
     non_sv_windows = defaultdict(list)
 
     # for chrom, chrom_len in chrome_lens.items():
@@ -90,6 +89,9 @@ def sample_non_sv_windows(clustered_sv_regions, chrome_lens, window_size=2000, s
                 non_sv_intervals.append((sv_clusters[i-1][0][1], sv_clusters[i][0][0]))
 
         # sample windows from random non-SV intervals
+        # NOTE: This sampling strategy may not be optimal as it may oversample from larger non-SV regions and undersample from smaller ones
+        # but it is a simple starting point. More sophisticated strategies can be implemented if needed. And the exact number of sampled windows per chromosome 
+        # may exceed the specified sample_per_chrom
         while len(non_sv_windows[chrom]) < sample_per_chrom:
             sampled_intervals = np.random.choice(range(len(non_sv_intervals)), size=min(sample_per_chrom, len(non_sv_intervals)), replace=False)
             
@@ -166,7 +168,7 @@ def check_bam_region(bam, chrom, start, end, sv_threshold=50):
     return True
 
 
-def label_patches(chrom, region, svs, bam, patch_size=200,):
+def label_patches(chrom, region, svs, bam, patch_size=200, min_overlap_bp=50):
 
     num_patches = (region[1] - region[0]) // patch_size
 
@@ -179,9 +181,15 @@ def label_patches(chrom, region, svs, bam, patch_size=200,):
         patch_start = region[0] + i * patch_size
         patch_end = patch_start + patch_size
 
-        for sv_start, sv_end in svs:
-            # overlap at least 1bp
-            if patch_end > sv_start and patch_start < sv_end:
+        for sv_start, sv_end, sv_type in svs:
+            if sv_type == "INS":
+                if patch_start <= sv_start < patch_end:
+                    labels[i] = 1
+                    break
+                continue
+
+            overlap = min(patch_end, sv_end) - max(patch_start, sv_start)
+            if overlap >= min_overlap_bp:
                 labels[i] = 1
                 break
         # if not overlap with any SV, keep label 0 but double check in bam
@@ -192,7 +200,33 @@ def label_patches(chrom, region, svs, bam, patch_size=200,):
     return labels
 
 
-def generate_labeled_windows(chrom, target_region, bam_file, output_dir, width=2000, stride=500, non_sv=False):
+def build_sv_window_starts(region, svs, width=2000, stride=500, sv_thresh=50, start_jitter=50):
+    cluster_start = min(sv[0] for sv in svs)
+    cluster_end = max(sv[1] for sv in svs)
+
+    min_region_start = region[0]
+    max_region_start = region[1] - width
+
+    min_win_start = max(min_region_start, cluster_start - width + sv_thresh)
+    max_win_start = min(max_region_start, cluster_end - sv_thresh)
+
+    if max_win_start < min_win_start:
+        return [int(np.clip(min_win_start, min_region_start, max_region_start))]
+
+    window_starts = list(range(min_win_start, max_win_start + 1, stride))
+    if window_starts[-1] != max_win_start:
+        window_starts.append(max_win_start)
+
+    jittered_starts = []
+    for win_start in window_starts:
+        jitter = np.random.randint(-start_jitter, start_jitter + 1)
+        jittered_start = int(np.clip(win_start + jitter, min_region_start, max_region_start))
+        jittered_starts.append(jittered_start)
+
+    return jittered_starts
+
+
+def generate_labeled_windows(chrom, target_region, bam_file, output_dir, width=2000, stride=500, non_sv=False, sv_thresh=50, start_jitter=50):
 
     bam = pysam.AlignmentFile(bam_file, "rb")
 
@@ -201,16 +235,22 @@ def generate_labeled_windows(chrom, target_region, bam_file, output_dir, width=2
     # for chrom, regions in target_regions.items():
     # for region_info in target_regions:
     region, svs = target_region
-    # window slide with 500bp stride but need to cover the last base
-    if (region[1] - region[0]) % width == 0:
-        window_starts = list(range(region[0], region[1] - width + 1, stride))
-        window_ends = list(range(region[0] + width, region[1] + 1, stride))
-    else:
-        window_starts = list(range(region[0], region[1] - width + 1, stride)) + [region[1] - width]
-        window_ends = list(range(region[0] + width, region[1] + 1, stride)) + [region[1]]
 
-    for win_start, win_end in zip(window_starts, window_ends):
-        labels = label_patches(chrom, (win_start, win_end), svs, bam)
+    if svs:
+        window_starts = build_sv_window_starts(
+            region,
+            svs,
+            width=width,
+            stride=stride,
+            sv_thresh=sv_thresh,
+            start_jitter=start_jitter,
+        )
+    else:
+        window_starts = [region[0]]
+
+    for win_start in window_starts:
+        win_end = win_start + width
+        labels = label_patches(chrom, (win_start, win_end), svs, bam, min_overlap_bp=50)
 
         if labels.sum() != 0 and non_sv:
             continue  # skip windows with any SV labels if generating non-SV data

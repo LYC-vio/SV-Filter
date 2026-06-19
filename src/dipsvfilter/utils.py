@@ -108,7 +108,7 @@ def parse_pysam_vcf_record(vcf_record):
         # "info": info,
         "sv_type": infer_sv_type(vcf_record.ref, alts, info),
         "start": vcf_record.start,
-        "end": vcf_record.start + len(vcf_record.ref),
+        "end": vcf_record.stop if vcf_record.stop is not None else (vcf_record.start + max(1, len(vcf_record.ref))),
         "alleles": vcf_record.alleles,
         # "samples": samples,
         "gt": gt,

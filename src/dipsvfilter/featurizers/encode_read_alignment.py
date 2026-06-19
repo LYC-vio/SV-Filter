@@ -218,6 +218,59 @@ def encode_region(bam, contig, region_start, region_end):
     return normalized_features
 
 
+def encode_records(records, region_start, region_end, contig=None):
+    """
+    Encode a reference interval from a preselected collection of alignment records.
+
+    This function mirrors ``encode_region`` but takes an iterable of
+    ``pysam.AlignedSegment`` objects instead of fetching every record from a BAM.
+    It is intended for pair-aware workflows where reads have already been
+    assigned to one haplotype in memory.
+
+    Parameters:
+        records (iterable): Alignment records to consider for encoding.
+        region_start (int): Start of the target interval, 0-based inclusive.
+        region_end (int): End of the target interval, 0-based exclusive.
+        contig (str, optional): If provided, skip records mapped to other contigs.
+
+    Returns:
+        np.ndarray: Log-normalized feature matrix with shape
+        ``(region_end - region_start, 9)``.
+    """
+
+    region_length = region_end - region_start
+    feature_matrix = np.zeros((region_length, 9), dtype=np.float32)
+
+    for segment in records:
+        if segment.is_unmapped:
+            continue
+        if contig is not None and segment.reference_name != contig:
+            continue
+        if segment.reference_start is None or segment.reference_end is None:
+            continue
+        if segment.reference_end <= region_start or segment.reference_start >= region_end:
+            continue
+
+        trimmed_cigar = trim_cigar(segment, region_start, region_end)
+        trimmed_md = trim_mdtag(segment, region_start, region_end)
+
+        related_start = max(0, segment.reference_start - region_start)
+        related_end = min(region_length, segment.reference_end - region_start)
+
+        update_feature_matrix(feature_matrix, trimmed_cigar, trimmed_md, related_start, related_end)
+
+    with np.errstate(divide='ignore', invalid='ignore'):
+        insertion_counts = feature_matrix[:, 3]
+        deletion_counts = feature_matrix[:, 1]
+
+        feature_matrix[:, 4] = np.where(insertion_counts > 0, feature_matrix[:, 4] / insertion_counts, 0)
+        feature_matrix[:, 6] = np.where(deletion_counts > 0, feature_matrix[:, 6] / deletion_counts, 0)
+
+    normalized_features = logify_numpy(feature_matrix).astype("float32")
+
+    return normalized_features
+
+
 
 def main(bam_file, contig, region_start, region_end, window_size=200, output_dir="./features/"):
     """
